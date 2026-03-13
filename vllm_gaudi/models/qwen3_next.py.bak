@@ -1,0 +1,528 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""HPU adaptations for Qwen3-Next / Qwen3.5 models.
+
+Key changes vs upstream Qwen3NextGatedDeltaNet._forward_core():
+  1. causal_conv1d_fn / causal_conv1d_update
+       → hpu_causal_conv1d_fn / hpu_causal_conv1d_update   (already in Gaudi)
+  2. fused_gdn_gating (Triton kernel)
+       → hpu_fused_gdn_gating                              (new, hpu_gdn.py)
+  3. chunk_gated_delta_rule (FLA Triton)
+       → hpu_chunk_gated_delta_rule                        (new, hpu_gdn.py)
+  4. fused_recurrent_gated_delta_rule (FLA Triton)
+       → hpu_fused_recurrent_gated_delta_rule              (new, hpu_gdn.py)
+
+The MoE block (Qwen3NextSparseMoeBlock) gets the same 3-D reshape guard
+that qwen3_moe.py applies to Qwen3MoeSparseMoeBlock.
+
+HpuQwen3NextForCausalLM wraps Qwen3NextForCausalLM and replaces the
+sub-modules after __init__ so that no upstream code needs patching.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Iterable
+
+import numpy as np
+import torch
+from torch import nn
+
+if TYPE_CHECKING:
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
+
+from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.model_executor.models.qwen3_next import (
+    Qwen3NextForCausalLM,
+    Qwen3NextGatedDeltaNet,
+    Qwen3NextSparseMoeBlock,
+    fused_gdn_gating,                # upstream Triton version (imported for reference)
+)
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+from vllm_gaudi.ops.causal_conv1d_pytorch import (
+    hpu_causal_conv1d_fn,
+    hpu_causal_conv1d_update,
+)
+from vllm_gaudi.ops.hpu_gdn import (
+    hpu_chunk_gated_delta_rule,
+    hpu_fused_gdn_gating,
+    hpu_fused_recurrent_gated_delta_rule,
+)
+
+
+# ---------------------------------------------------------------------------
+# GDN layer override
+# ---------------------------------------------------------------------------
+
+class HPUQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet):
+    """Qwen3NextGatedDeltaNet with Triton kernels replaced by HPU-safe ops."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output: torch.Tensor,
+    ):
+        """Override to handle batched 3-D (B, T, H) input from HPU model runner.
+
+        The upstream forward expects 2-D (T, H) tensors because it uses
+        ``hidden_states.size(0)`` as ``num_tokens`` and ``rearrange``
+        patterns like ``"l p d -> l (p d)"`` that require exactly 3 dims.
+
+        The HPU V1 model runner passes token embeddings as (B, T, H) with
+        B=1, so we squeeze the batch dimension before delegating and let the
+        parent handle the rest (which picks up our overridden _forward_core).
+        """
+        squeezed = hidden_states.dim() == 3
+        if squeezed:
+            hidden_states = hidden_states.squeeze(0)  # (B, T, H) → (T, H)
+            output = output.squeeze(0)                # (B, T, H) → (T, H)
+        return super().forward(hidden_states, output)
+
+    def _forward_core(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ):
+        """Core GDN attention — HPU version.
+
+        Identical flow to upstream _forward_core but with:
+          - causal_conv1d_fn/update  → hpu variants
+          - fused_gdn_gating         → hpu_fused_gdn_gating
+          - chunk_gated_delta_rule   → hpu_chunk_gated_delta_rule
+          - fused_recurrent_gated_delta_rule → hpu version
+        """
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+
+        if attn_metadata is None:
+            # Profile run — nothing to do
+            return
+
+        assert isinstance(attn_metadata, dict)
+        attn_metadata = attn_metadata[self.prefix]
+        assert isinstance(attn_metadata, GDNAttentionMetadata)
+
+        has_initial_state = attn_metadata.has_initial_state
+        spec_query_start_loc = attn_metadata.spec_query_start_loc
+        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+        spec_sequence_masks = attn_metadata.spec_sequence_masks
+        spec_token_indx = attn_metadata.spec_token_indx
+        non_spec_token_indx = attn_metadata.non_spec_token_indx
+        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+
+        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+        conv_state = self_kv_cache[0].transpose(-1, -2)
+        ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_accepted_tokens = attn_metadata.num_accepted_tokens
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        # ----------------------------------------------------------------
+        # 1. causal_conv1d
+        # ----------------------------------------------------------------
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+
+        if spec_sequence_masks is not None:
+            if (attn_metadata.num_prefills == 0
+                    and attn_metadata.num_decodes == 0):
+                mixed_qkv_spec = mixed_qkv
+                mixed_qkv_non_spec = None
+            else:
+                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+                mixed_qkv_non_spec = mixed_qkv.index_select(
+                    0, non_spec_token_indx)
+        else:
+            mixed_qkv_spec = None
+            mixed_qkv_non_spec = mixed_qkv
+
+        # 1.1 speculative tokens
+        if spec_sequence_masks is not None:
+            mixed_qkv_spec = hpu_causal_conv1d_update(
+                mixed_qkv_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=spec_state_indices_tensor[:, 0][
+                    :attn_metadata.num_spec_decodes
+                ],
+                num_accepted_tokens=num_accepted_tokens,
+                query_start_loc=spec_query_start_loc,
+                max_query_len=spec_state_indices_tensor.size(-1),
+                validate_data=False,
+            )
+
+        # 1.2 normal tokens
+        if attn_metadata.num_prefills > 0:
+            mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
+            mixed_qkv_non_spec = hpu_causal_conv1d_fn(
+                mixed_qkv_non_spec_T,
+                conv_weights,
+                self.conv1d.bias,
+                conv_states=conv_state,
+                has_initial_state=has_initial_state,
+                cache_indices=non_spec_state_indices_tensor,
+                query_start_loc=non_spec_query_start_loc,
+                activation=self.activation,
+                metadata=attn_metadata,
+            ).transpose(0, 1)
+        elif attn_metadata.num_decodes > 0:
+            mixed_qkv_non_spec = hpu_causal_conv1d_update(
+                mixed_qkv_non_spec,
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=non_spec_state_indices_tensor[
+                    :attn_metadata.num_actual_tokens
+                ],
+                validate_data=True,
+            )
+        else:
+            mixed_qkv_non_spec = None
+
+        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(
+            mixed_qkv_spec)
+        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+            mixed_qkv_non_spec)
+
+        # ----------------------------------------------------------------
+        # 2. Gating  (replaces Triton fused_gdn_gating_kernel)
+        # ----------------------------------------------------------------
+        g, beta = hpu_fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+
+        if spec_sequence_masks is not None:
+            if (attn_metadata.num_prefills == 0
+                    and attn_metadata.num_decodes == 0):
+                g_spec = g
+                beta_spec = beta
+                g_non_spec = None
+                beta_non_spec = None
+            else:
+                g_spec = g.index_select(1, spec_token_indx)
+                beta_spec = beta.index_select(1, spec_token_indx)
+                g_non_spec = g.index_select(1, non_spec_token_indx)
+                beta_non_spec = beta.index_select(1, non_spec_token_indx)
+        else:
+            g_spec = None
+            beta_spec = None
+            g_non_spec = g
+            beta_non_spec = beta
+
+        # ----------------------------------------------------------------
+        # 3. Recurrent attention
+        # ----------------------------------------------------------------
+
+        # 3.1 speculative tokens
+        if spec_sequence_masks is not None:
+            core_attn_out_spec, _ = hpu_fused_recurrent_gated_delta_rule(
+                q=query_spec,
+                k=key_spec,
+                v=value_spec,
+                g=g_spec,
+                beta=beta_spec,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=spec_query_start_loc[
+                    :attn_metadata.num_spec_decodes + 1
+                ],
+                ssm_state_indices=spec_state_indices_tensor,
+                num_accepted_tokens=num_accepted_tokens,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            core_attn_out_spec = None
+
+        # 3.2 normal tokens (prefill)
+        if attn_metadata.num_prefills > 0:
+            initial_state = ssm_state[
+                non_spec_state_indices_tensor].contiguous()
+            initial_state[~has_initial_state, ...] = 0
+            core_attn_out_non_spec, last_state = hpu_chunk_gated_delta_rule(
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                g=g_non_spec,
+                beta=beta_non_spec,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=non_spec_query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            # Write updated states back to the cache
+            ssm_state[non_spec_state_indices_tensor] = last_state.to(
+                ssm_state.dtype)
+
+        # 3.3 normal tokens (decode)
+        elif attn_metadata.num_decodes > 0:
+            core_attn_out_non_spec, _ = hpu_fused_recurrent_gated_delta_rule(
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                g=g_non_spec,
+                beta=beta_non_spec,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=non_spec_query_start_loc[
+                    :attn_metadata.num_decodes + 1
+                ],
+                ssm_state_indices=non_spec_state_indices_tensor,
+                use_qk_l2norm_in_kernel=True,
+            )
+        else:
+            core_attn_out_non_spec = None
+
+        # ----------------------------------------------------------------
+        # 4. Merge outputs
+        # ----------------------------------------------------------------
+        if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
+            merged = torch.empty(
+                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
+                dtype=core_attn_out_non_spec.dtype,
+                device=core_attn_out_non_spec.device,
+            )
+            merged.index_copy_(1, spec_token_indx, core_attn_out_spec)
+            merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            core_attn_out[:num_actual_tokens] = merged.squeeze(0)
+        elif spec_sequence_masks is not None:
+            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
+        else:
+            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+
+# ---------------------------------------------------------------------------
+# MoE block override  (same 3-D reshape guard as qwen3_moe.py)
+# ---------------------------------------------------------------------------
+
+class HPUQwen3NextSparseMoeBlock(Qwen3NextSparseMoeBlock):
+    """Qwen3NextSparseMoeBlock with HPU-friendly tensor handling."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_dim = orig_shape[-1]
+        hs = hidden_states.reshape(-1, hidden_dim)
+        return super().forward(hs).reshape(*orig_shape[:-1], hidden_dim)
+
+
+# ---------------------------------------------------------------------------
+# In-place upgrade helpers
+# ---------------------------------------------------------------------------
+
+def upgrade_qwen3_next_blocks_inplace(model: nn.Module) -> None:
+    """Walk the model and replace GDN + MoE blocks with HPU variants."""
+    lm_model = getattr(model, "model", None)
+    layers = getattr(lm_model, "layers", None)
+    if layers is None:
+        return
+
+    gdn_replaced = 0
+    moe_replaced = 0
+
+    for layer in layers:
+        # Replace GDN (linear attention) block
+        self_attn = getattr(layer, "self_attn", None)
+        if (self_attn is not None
+                and isinstance(self_attn, Qwen3NextGatedDeltaNet)
+                and not isinstance(self_attn, HPUQwen3NextGatedDeltaNet)):
+            self_attn.__class__ = HPUQwen3NextGatedDeltaNet
+            gdn_replaced += 1
+
+        # Replace MoE block
+        mlp = getattr(layer, "mlp", None)
+        if (mlp is not None
+                and isinstance(mlp, Qwen3NextSparseMoeBlock)
+                and not isinstance(mlp, HPUQwen3NextSparseMoeBlock)):
+            mlp.__class__ = HPUQwen3NextSparseMoeBlock
+            moe_replaced += 1
+
+    if gdn_replaced or moe_replaced:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            "HPU Qwen3Next: replaced %d GDN layers and %d MoE blocks.",
+            gdn_replaced, moe_replaced,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Top-level model class registered with ModelRegistry
+# ---------------------------------------------------------------------------
+
+class HpuQwen3NextForCausalLM(Qwen3NextForCausalLM):
+    """Qwen3NextForCausalLM with HPU-optimised sub-modules.
+
+    Registered for both:
+      - Qwen3NextForCausalLM
+      - Qwen3_5MoeForConditionalGeneration  (Qwen3.5 text backbone)
+    """
+
+    def __init__(self, *, vllm_config, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        upgrade_qwen3_next_blocks_inplace(self)
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: "list[MultiModalFeatureSpec]",
+    ) -> "tuple[torch.Tensor, int]":
+        """Text-only mRoPE positions for Qwen3.5 hybrid model.
+
+        Qwen3.5 has ``mrope_section`` in its ``rope_parameters``, which
+        triggers ``uses_mrope=True`` in vLLM.  For text-only inference
+        (no vision tokens) all three mRoPE sections share the same
+        sequential positions, so we just broadcast 1-D positions to the
+        required [3, T] shape and return a delta of 0.
+        """
+        n = len(input_tokens)
+        pos = np.broadcast_to(np.arange(n), (3, n))
+        return torch.from_numpy(pos.copy()), 0
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        """Load weights from Qwen3.5 VL-style checkpoint.
+
+        The Qwen3.5-35B-A3B checkpoint uses a VL wrapper convention:
+          - Text weights stored under  ``model.language_model.*``
+          - Vision weights stored under ``model.visual.*``
+          - Expert weights fused as    ``*.mlp.experts.gate_up_proj``
+            shape [num_experts, 2*intermediate, hidden] (all experts stacked)
+            and  ``*.mlp.experts.down_proj``
+            shape [num_experts, hidden, intermediate]
+
+        This override remaps names to the flat ``model.*`` layout that
+        ``Qwen3NextForCausalLM`` / ``AutoWeightsLoader`` expects, and
+        unfuses the stacked expert tensors into per-expert named weights
+        so they route correctly through ``make_expert_params_mapping``.
+        """
+        return super().load_weights(self._remap_weights(weights))
+
+    @staticmethod
+    def _remap_weights(
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Generator that transforms Qwen3.5 checkpoint keys → vLLM keys.
+
+        Handles three transformations:
+        1. Prefix:  model.language_model.X → model.X
+        2. Expert weights: stacked [E, dim1, dim2] → per-expert N.proj.weight
+        3. GDN projections:
+             in_proj_qkv + in_proj_z  → in_proj_qkvz  (cat dim 0)
+             in_proj_b  + in_proj_a   → in_proj_ba     (cat dim 0)
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+        _LM_PFX = "model.language_model."
+        _VIS_PFX = "model.visual."
+
+        # Buffers for GDN projection halves that arrive separately.
+        # key = remapped name (e.g. "model.layers.0.linear_attn.in_proj_qkv.weight")
+        pending: dict[str, torch.Tensor] = {}
+
+        def _try_emit_qkvz(base: str):
+            qkv_key = base + ".in_proj_qkv.weight"
+            z_key   = base + ".in_proj_z.weight"
+            if qkv_key in pending and z_key in pending:
+                return (base + ".in_proj_qkvz.weight",
+                        torch.cat([pending.pop(qkv_key),
+                                   pending.pop(z_key)], dim=0))
+            return None
+
+        def _try_emit_ba(base: str):
+            b_key = base + ".in_proj_b.weight"
+            a_key = base + ".in_proj_a.weight"
+            if b_key in pending and a_key in pending:
+                return (base + ".in_proj_ba.weight",
+                        torch.cat([pending.pop(b_key),
+                                   pending.pop(a_key)], dim=0))
+            return None
+
+        for name, tensor in weights:
+            # Skip vision encoder — not used by text-only inference
+            if name.startswith(_VIS_PFX):
+                continue
+
+            # Remap  model.language_model.X  →  model.X
+            if name.startswith(_LM_PFX):
+                name = "model." + name[len(_LM_PFX):]
+
+            # ----------------------------------------------------------------
+            # Stacked expert weights  [E, dim1, dim2]  → per-expert entries
+            # ----------------------------------------------------------------
+            # Checkpoint: *.mlp.experts.gate_up_proj  [E, 2*I, H]
+            # Needed:     *.mlp.experts.N.gate_proj.weight  [I, H]
+            #             *.mlp.experts.N.up_proj.weight    [I, H]
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                base = name[: -len(".gate_up_proj")]
+                n_experts = tensor.shape[0]
+                half = tensor.shape[1] // 2
+                for i in range(n_experts):
+                    yield base + f".{i}.gate_proj.weight", tensor[i, :half]
+                    yield base + f".{i}.up_proj.weight", tensor[i, half:]
+                continue
+
+            # Checkpoint: *.mlp.experts.down_proj  [E, H, I]
+            # Needed:     *.mlp.experts.N.down_proj.weight  [H, I]
+            if name.endswith(".mlp.experts.down_proj"):
+                base = name[: -len(".down_proj")]
+                n_experts = tensor.shape[0]
+                for i in range(n_experts):
+                    yield base + f".{i}.down_proj.weight", tensor[i]
+                continue
+
+            # ----------------------------------------------------------------
+            # GDN projection fusion — buffer halves, emit when pair is complete
+            # ----------------------------------------------------------------
+            # Checkpoint has separate:  in_proj_qkv  +  in_proj_z
+            # vLLM expects fused:       in_proj_qkvz  = cat([qkv, z], dim=0)
+            if name.endswith(".in_proj_qkv.weight"):
+                base = name[: -len(".in_proj_qkv.weight")]
+                pending[name] = tensor
+                result = _try_emit_qkvz(base)
+                if result is not None:
+                    yield result
+                continue
+
+            if name.endswith(".in_proj_z.weight"):
+                base = name[: -len(".in_proj_z.weight")]
+                pending[name] = tensor
+                result = _try_emit_qkvz(base)
+                if result is not None:
+                    yield result
+                continue
+
+            # Checkpoint has separate:  in_proj_b  +  in_proj_a
+            # vLLM expects fused:       in_proj_ba  = cat([b, a], dim=0)
+            if name.endswith(".in_proj_b.weight"):
+                base = name[: -len(".in_proj_b.weight")]
+                pending[name] = tensor
+                result = _try_emit_ba(base)
+                if result is not None:
+                    yield result
+                continue
+
+            if name.endswith(".in_proj_a.weight"):
+                base = name[: -len(".in_proj_a.weight")]
+                pending[name] = tensor
+                result = _try_emit_ba(base)
+                if result is not None:
+                    yield result
+                continue
+
+            yield name, tensor
+
+        if pending:
+            _log.warning(
+                "HpuQwen3NextForCausalLM: unfused GDN projection weights "
+                "remaining in buffer (missing partner): %s",
+                list(pending.keys()),
+            )

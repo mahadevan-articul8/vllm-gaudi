@@ -30,6 +30,21 @@ def register_model():
     ModelRegistry.register_model("PixtralForConditionalGeneration",
                                  "vllm_gaudi.models.pixtral:HPUPixtralForConditionalGeneration")
 
+    from vllm_gaudi.models.qwen3_next import HpuQwen3NextForCausalLM  # noqa: F401
+    ModelRegistry.register_model(
+        "Qwen3NextForCausalLM",
+        "vllm_gaudi.models.qwen3_next:HpuQwen3NextForCausalLM")
+
+    from vllm_gaudi.models.qwen3_next import HpuQwen3_5MoeForCausalLM  # noqa: F401
+    ModelRegistry.register_model(
+        "Qwen3_5MoeForCausalLM",
+        "vllm_gaudi.models.qwen3_next:HpuQwen3_5MoeForCausalLM")
+
+    from vllm_gaudi.models.qwen3_next import HpuQwen3_5MoeForConditionalGeneration  # noqa: F401
+    ModelRegistry.register_model(
+        "Qwen3_5MoeForConditionalGeneration",
+        "vllm_gaudi.models.qwen3_next:HpuQwen3_5MoeForConditionalGeneration")
+
     import vllm_gaudi.models.deepseek_v2  # noqa: F401
 
     # DeepSeek V3 with HPU-optimized sparse attention (V3.2)

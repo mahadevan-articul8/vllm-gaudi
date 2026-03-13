@@ -401,22 +401,61 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
     if isinstance(model, HpuModelAdapter):
         model = model.model
 
-    if "GraniteMoeHybridForCausalLM" not in getattr(model.config, 'architectures', []):
-        return
+    architectures = getattr(model.config, 'architectures', [])
 
-    # Iterate through all KV cache groups
-    for group_idx, kv_group in enumerate(kv_cache_config.kv_cache_groups):
-        # kv_group.layer_names contains strings like "model.layers.5.mixer"
-        for layer_name in kv_group.layer_names:
-            # Extract layer index from name (e.g., "model.layers.5.mixer" -> 5)
-            if ".mixer" in layer_name:  # Only process mamba layers
-                parts = layer_name.split('.')
-                layer_idx = int(parts[2])  # "model.layers.5.mixer" -> 5
+    if "GraniteMoeHybridForCausalLM" in architectures:
+        # Iterate through all KV cache groups
+        for group_idx, kv_group in enumerate(kv_cache_config.kv_cache_groups):
+            # kv_group.layer_names contains strings like "model.layers.5.mixer"
+            for layer_name in kv_group.layer_names:
+                # Extract layer index from name (e.g., "model.layers.5.mixer" -> 5)
+                if ".mixer" in layer_name:  # Only process mamba layers
+                    parts = layer_name.split('.')
+                    layer_idx = int(parts[2])  # "model.layers.5.mixer" -> 5
 
-                # Access the actual layer
-                layer = model.model.layers[layer_idx]
-                assert hasattr(layer, 'mamba')
-                layer.mamba.cache_group_idx = group_idx
+                    # Access the actual layer
+                    layer = model.model.layers[layer_idx]
+                    assert hasattr(layer, 'mamba')
+                    layer.mamba.cache_group_idx = group_idx
+
+    _QWEN3_NEXT_ARCHS = {
+        "Qwen3NextForCausalLM", "HpuQwen3NextForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM", "HpuQwen3_5MoeForCausalLM",
+        "HpuQwen3_5MoeForConditionalGeneration",
+    }
+    if any(a in _QWEN3_NEXT_ARCHS for a in architectures):
+        # Find the MambaSpec group index for GDN layers
+        from vllm.v1.kv_cache_interface import MambaSpec
+        import logging
+        _log = logging.getLogger(__name__)
+        mamba_group_idx = None
+        for idx, kv_group in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(kv_group.kv_cache_spec, MambaSpec):
+                mamba_group_idx = idx
+                break
+        if mamba_group_idx is None:
+            _log.warning(
+                "HPU Qwen3Next: no MambaSpec group found in kv_cache_groups "
+                "(%d groups); GDN state indexing will default to 0.",
+                len(kv_cache_config.kv_cache_groups))
+        else:
+            _log.info("HPU Qwen3Next: setting mamba_group_idx=%d on all GDN layers.",
+                      mamba_group_idx)
+            # Handle VL wrapper: model.language_model.model.layers
+            # or direct: model.model.layers
+            inner = model
+            if hasattr(inner, 'language_model'):
+                inner = inner.language_model
+            layers = getattr(getattr(inner, 'model', None), 'layers', [])
+            count = 0
+            for layer in layers:
+                gdn = getattr(layer, 'linear_attn', None)
+                if gdn is not None and hasattr(gdn, '_find_mamba_group_idx'):
+                    gdn._mamba_group_idx = mamba_group_idx
+                    count += 1
+            _log.info("HPU Qwen3Next: set _mamba_group_idx=%d on %d GDN layers.",
+                      mamba_group_idx, count)
 
 
 def maybe_set_chunked_attention_layers(model_runner):
@@ -672,7 +711,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_usage', 'window_block_groups', 'window_attn_bias', 'chunked_block_mapping', 'chunked_attn_bias',
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'state_indices_tensor', 'query_start_loc', 'query_start_loc_p',
-        'padding_mask_flat', 'online_merge', 'split_graphs'
+        'padding_mask_flat', 'online_merge', 'split_graphs',
     ])
     return attention_metadata
 
@@ -850,7 +889,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.is_multimodal_raw_input_supported = (model_config.is_multimodal_raw_input_only_model)
 
         self.num_mamba_layers = self.model_config.get_num_layers_by_block_type(self.parallel_config, "mamba")
-        self.mamba_chunk_size = self.model_config.get_mamba_chunk_size() if self.num_mamba_layers > 0 else 0
+        # GDN (GatedDeltaNet) layers in Qwen3-Next/Qwen3.5 are reported as
+        # "linear_attention" block type in hf_config.layer_types (not "mamba"),
+        # but they use MambaBase recurrent state and need the same runtime paths.
+        self.num_gdn_layers = self.model_config.get_num_layers_by_block_type(
+            self.parallel_config, "linear_attention")
+        self.num_mamba_like_layers = self.num_mamba_layers + self.num_gdn_layers
+        self.mamba_chunk_size = self.model_config.get_mamba_chunk_size() if self.num_mamba_like_layers > 0 else 0
         self.use_hybrid_cache = os.getenv('VLLM_USE_HYBRID_CACHE', 'false').strip().lower() in ("1", "true")
         self.use_naive_mamba_cache_sharing = os.getenv('VLLM_USE_NAIVE_MAMBA_CACHE_SHARING',
                                                        'true').strip().lower() in ("1", "true")
@@ -1942,7 +1987,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             target_bs * target_seq <= self.max_num_tokens
 
     def _get_attention_group_id_for_hybrid(self):
-        if self.num_mamba_layers == 0 or len(self.kv_cache_config.kv_cache_groups) == 0:
+        if self.num_mamba_like_layers == 0 or len(self.kv_cache_config.kv_cache_groups) == 0:
             return 0
 
         for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
@@ -2107,7 +2152,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logits_indices = pad_list(logits_indices, round_up(len(logits_indices), self.logits_rounding),
                                   itertools.repeat(-1))
 
-        if self.num_mamba_layers > 0:
+        if self.num_mamba_like_layers > 0:
             # COMPUTE query_start_loc (similar to GPU)
             # This is a cumulative sum of query lengths
             query_start_loc_p_cpu = torch.zeros(len(query_lens) + 1,
@@ -2223,6 +2268,9 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             last_chunk_indices_p = None
             padding_mask_flat = None
             query_start_loc_p = None
+            query_start_loc_p_cpu = None
+            all_state_indices_cpu = None
+            has_initial_states_cpu = None
 
         query_lens = async_h2d_copy(query_lens, dtype=torch.int32)
         token_ids = async_h2d_copy(token_ids, dtype=torch.int32)
@@ -2244,7 +2292,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                      last_chunk_indices_p=last_chunk_indices_p,
                                                                      state_indices_tensor=state_indices_tensor,
                                                                      query_start_loc=query_start_loc_p,
-                                                                     padding_mask_flat=padding_mask_flat)
+                                                                     padding_mask_flat=padding_mask_flat,
+                                                                     query_start_loc_p_cpu=query_start_loc_p_cpu,
+                                                                     state_indices_tensor_cpu=all_state_indices_cpu,
+                                                                     has_initial_states_p_cpu=has_initial_states_cpu)
         return PrefillInputData(request_ids=[req_ids],
                                 prompt_lens=[query_lens],
                                 token_ids=[token_ids],
@@ -2517,7 +2568,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     block_tables_chunk, slot_mapping.tolist(),
                     padded_batch_size * num_tokens)
 
-        if self.num_mamba_layers > 0:
+        if self.num_mamba_like_layers > 0:
             all_state_indices_cpu = []
             for group_idx in range(len(self.input_batch.block_table.block_tables)):
                 block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
@@ -2549,6 +2600,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             seq_lens_tensor = None
             state_indices_tensor = None
             query_start_loc_p = None
+            query_start_loc_p_cpu = None
+            all_state_indices_cpu = None
 
         # CPU<>HPU sync *should not* happen here.
         block_list_device = async_h2d_copy(block_list, device=self.device)
@@ -2613,6 +2666,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             state_indices_tensor=state_indices_tensor,
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
+            query_start_loc_p_cpu=query_start_loc_p_cpu,
+            state_indices_tensor_cpu=all_state_indices_cpu,
         )
 
         return DecodeInputData(num_decodes=num_decodes,
@@ -3051,6 +3106,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.model_has_chunked_attention:
             additional_kwargs.update({"model_has_chunked_attention": True})
         trimmed_attn_metadata = attn_metadata if self.unified_attn else trim_attn_metadata(attn_metadata)
+
+        # Populate GDN CPU metadata side-channel (lazy-mode safe).
+        # CPU tensors must NOT be in TrimmedAttentionMetadata (they poison
+        # mark_step), so we pass them via a module-level dict instead.
+        from vllm_gaudi.v1.attention.backends.hpu_attn import _gdn_cpu_metadata
+        _gdn_cpu_metadata['query_start_loc_p_cpu'] = getattr(attn_metadata, 'query_start_loc_p_cpu', None)
+        _gdn_cpu_metadata['state_indices_tensor_cpu'] = getattr(attn_metadata, 'state_indices_tensor_cpu', None)
+        _gdn_cpu_metadata['has_initial_states_p_cpu'] = getattr(attn_metadata, 'has_initial_states_p_cpu', None)
         if self.is_driver_worker:
             model_event_name = ("model_forward_"
                                 f"bs{batch_size}_"
@@ -3079,6 +3142,41 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         hidden_states = hidden_states[logits_indices]
+        # --- LOGIT DIAG ---
+        import os as _os_logit
+        if _os_logit.environ.get("LOGIT_DIAG", "0") == "1":
+            import sys as _sys_logit
+            _logit_diag_count = getattr(self, '_logit_diag_count', 0)
+            if _logit_diag_count < 3:
+                self._logit_diag_count = _logit_diag_count + 1
+                print(f"\n  [LOGIT_DIAG #{self._logit_diag_count}] hidden_states shape={hidden_states.shape}",
+                      file=_sys_logit.stderr)
+                print(f"    logits_indices={logits_indices[:5].tolist()} (first 5)",
+                      file=_sys_logit.stderr)
+                hs = hidden_states[0].float()
+                print(f"    hs[0] norm={hs.norm().item():.4f} mean={hs.mean().item():.6f} "
+                      f"std={hs.std().item():.6f}", file=_sys_logit.stderr)
+                print(f"    hs[0][:10]={hs[:10].tolist()}", file=_sys_logit.stderr)
+                # Manual logit computation - navigate wrapper to get lm_head
+                _inner = self.model
+                for _attr in ('model', 'language_model'):
+                    if hasattr(_inner, _attr):
+                        _inner = getattr(_inner, _attr)
+                if hasattr(_inner, 'lm_head'):
+                    lm_head_w = _inner.lm_head.weight  # [vocab, hidden]
+                    manual_logits = hs @ lm_head_w.float().t()  # [vocab]
+                    topk = manual_logits.topk(10)
+                    print(f"    manual top-10 IDs: {topk.indices.tolist()}", file=_sys_logit.stderr)
+                    print(f"    manual top-10 values: {[f'{v:.3f}' for v in topk.values.tolist()]}",
+                          file=_sys_logit.stderr)
+                    from transformers import AutoTokenizer
+                    _tok = AutoTokenizer.from_pretrained('/models/Qwen3.5/Qwen3.5-35B-A3B', trust_remote_code=True)
+                    print(f"    manual top-10 decoded: {[_tok.decode([t]) for t in topk.indices.tolist()]}",
+                          file=_sys_logit.stderr)
+                else:
+                    print(f"    Could not find lm_head in {type(_inner).__name__}", file=_sys_logit.stderr)
+                _sys_logit.stderr.flush()
+        # --- END LOGIT DIAG ---
         LoraMask.setLoraMask(lora_logits_mask)
         with self.profiler.record_event('internal', ('compute_logits'
                                                      f'{batch_size}_'
@@ -4784,7 +4882,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         req_id = f'{len(requests)}'
         block_ids = [[block_id] *
                      (round_up(total_tokens_for_blocks, g.kv_cache_spec.block_size) // g.kv_cache_spec.block_size)
-                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_layers > 0 else [[block_id] *
+                     for g in self.kv_cache_config.kv_cache_groups] if self.num_mamba_like_layers > 0 else [[block_id] *
                                                                                                        num_blocks]
         if self.is_pooling_model:
             model = cast(VllmModelForPooling, self.get_model())
@@ -5303,7 +5401,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             else:
                 max_bucket = max(self.bucketing_manager.decode_buckets[-1][0],
                                  self.bucketing_manager.prompt_buckets[-1][0])
-            if not self.num_mamba_layers and max_bucket > self.input_batch.max_num_reqs:
+            if not self.num_mamba_like_layers and max_bucket > self.input_batch.max_num_reqs:
                 input_batch_bkp = self.input_batch
                 self.input_batch = InputBatch(
                     max_num_reqs=self.bucketing_manager.decode_buckets[-1][0],
@@ -5405,7 +5503,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         logger.info(msg)
         self.profiler.end()
 
-        if not (self.num_mamba_layers or self.unified_attn or self.is_pooling_model) \
+        if not (self.num_mamba_like_layers or self.unified_attn or self.is_pooling_model) \
              and max_bucket > self.input_batch.max_num_reqs:
             self.input_batch = input_batch_bkp
         # NOTE(kzawora): This is a nasty workaround - for whatever cache_utils-related reason,
@@ -5616,7 +5714,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
-        if self.num_mamba_layers > 0:
+        if self.num_mamba_like_layers > 0:
             maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
         # if len(kv_cache_config.kv_cache_groups) > 1:
         block_sizes = [kv_cache_group.kv_cache_spec.block_size for kv_cache_group in kv_cache_config.kv_cache_groups]
@@ -5645,7 +5743,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.initialize_attn_backend(kv_cache_config)
         kv_caches: dict[str, torch.Tensor] = {}
 
-        if self.use_hybrid_cache and self.num_mamba_layers > 0:
+        if self.use_hybrid_cache and self.num_mamba_like_layers > 0:
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 # taking into account dummy block
                 size = (kv_cache_tensor.size + kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes)
@@ -5694,7 +5792,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         kv_caches[layer_name] = tuple(state_tensors)
                     else:
                         pass
-        elif self.use_naive_mamba_cache_sharing and self.num_mamba_layers > 0:
+        elif self.use_naive_mamba_cache_sharing and self.num_mamba_like_layers > 0:
             for group in kv_cache_config.kv_cache_groups:
                 kv_cache_spec = group.kv_cache_spec
                 for layer_name in group.layer_names:

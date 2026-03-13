@@ -377,6 +377,9 @@ def _naive_prompt_attention(query: torch.Tensor,
     return attn_weights
 
 
+_FSDPA_DIAG = os.environ.get("FSDPA_DIAG", "0") == "1"
+_fsdpa_diag_count = 0
+
 def _fsdpa_prompt_attention(query: torch.Tensor,
                             key: torch.Tensor,
                             value: torch.Tensor,
@@ -388,6 +391,7 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
                             window_size: Optional[int] = None,
                             sinks: Optional[torch.Tensor] = None,
                             **ignored_args) -> torch.Tensor:
+    global _fsdpa_diag_count
     query = query.transpose(1, 2)
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
@@ -404,6 +408,29 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
         is_causal = False
         valid_seq_lengths = None
 
+    if _FSDPA_DIAG and _fsdpa_diag_count < 12:
+        _fsdpa_diag_count += 1
+        import sys
+        print(f"\n  [FSDPA #{_fsdpa_diag_count}] q={query.shape} k={key.shape} v={value.shape} "
+              f"scale={scale:.6f} is_causal={is_causal}", file=sys.stderr)
+        print(f"    attn_bias={'None' if attn_bias is None else attn_bias.shape} "
+              f"valid_seq_lengths={valid_seq_lengths}", file=sys.stderr)
+        if attn_bias is not None:
+            ab = attn_bias.float()
+            ninf = (ab == float('-inf')).sum().item()
+            total = ab.numel()
+            print(f"    attn_bias: {ninf}/{total} entries are -inf ({100*ninf/total:.1f}%)",
+                  file=sys.stderr)
+            # Check what real token (position 0) can attend to
+            if ab.dim() >= 4:
+                row0 = ab[0, 0, 0, :]  # First query position in first batch, first head
+                can_attend = (row0 != float('-inf')).sum().item()
+                print(f"    position 0 can attend to {can_attend} positions", file=sys.stderr)
+        # Check q/k values at position 0
+        print(f"    q[0,0,0,:5]={query[0,0,0,:5].tolist()}", file=sys.stderr)
+        print(f"    k[0,0,0,:5]={key[0,0,0,:5].tolist()}", file=sys.stderr)
+        sys.stderr.flush()
+
     args = [
         query, key, value, attn_bias, 0.0, is_causal, scale, softmax_mode, recompute_mode, valid_seq_lengths,
         padding_side
@@ -416,6 +443,15 @@ def _fsdpa_prompt_attention(query: torch.Tensor,
     if sinks is not None:
         args += [sinks]
     attn_weights = fsdpa_op(*args)
+
+    if _FSDPA_DIAG and _fsdpa_diag_count <= 12:
+        import sys
+        out = attn_weights
+        print(f"    FSDPA output: shape={out.shape} mean={out.float().mean().item():.6f} "
+              f"std={out.float().std().item():.6f}", file=sys.stderr)
+        # Check output at position 0 (real token)
+        print(f"    out[0,0,0,:5]={out[0,0,0,:5].tolist()}", file=sys.stderr)
+        sys.stderr.flush()
 
     attn_weights = attn_weights.transpose(1, 2)
     if sinks is not None:

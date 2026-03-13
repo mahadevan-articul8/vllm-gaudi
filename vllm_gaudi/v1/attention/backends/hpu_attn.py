@@ -17,6 +17,14 @@ from vllm.v1.attention.backends.registry import (register_backend, AttentionBack
 
 logger = init_logger()
 
+# Side-channel for GDN CPU metadata.  The model runner populates this dict
+# before each forward pass.  GDN layers read from it to avoid putting CPU
+# tensors into the HPU lazy graph (which causes mark_step crashes).
+# Keys: 'query_start_loc_p_cpu', 'state_indices_tensor_cpu',
+#        'has_initial_states_p_cpu'
+# Single-worker, single-threaded — no lock needed.
+_gdn_cpu_metadata: dict = {}
+
 
 @register_backend(AttentionBackendEnum.CUSTOM, "HPU_ATTN_V1")
 class HPUAttentionBackendV1(HPUAttentionBackend):
@@ -55,6 +63,12 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
     online_merge: bool = False
     split_graphs: bool = False
 
+    # CPU copies of GDN metadata — used by GDN layers to avoid .item()/.tolist()
+    # on HPU tensors, which would break lazy mode.
+    query_start_loc_p_cpu: Optional[torch.Tensor] = None
+    state_indices_tensor_cpu: Optional[torch.Tensor] = None
+    has_initial_states_p_cpu: Optional[torch.Tensor] = None
+
     def seq_len(self):
         return self.slot_mapping.size(-1)
 
@@ -76,7 +90,10 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                               last_chunk_indices_p=None,
                               state_indices_tensor=None,
                               query_start_loc=None,
-                              padding_mask_flat=None):
+                              padding_mask_flat=None,
+                              query_start_loc_p_cpu=None,
+                              state_indices_tensor_cpu=None,
+                              has_initial_states_p_cpu=None):
         return cls(is_prompt=True,
                    block_list=block_list,
                    block_mapping=None,
@@ -95,7 +112,10 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    state_indices_tensor=state_indices_tensor,
                    query_start_loc=query_start_loc,
                    query_start_loc_p=query_start_loc,
-                   padding_mask_flat=padding_mask_flat)
+                   padding_mask_flat=padding_mask_flat,
+                   query_start_loc_p_cpu=query_start_loc_p_cpu,
+                   state_indices_tensor_cpu=state_indices_tensor_cpu,
+                   has_initial_states_p_cpu=has_initial_states_p_cpu)
 
     @classmethod
     def make_decode_metadata(cls,
@@ -113,7 +133,9 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              chunked_block_groups,
                              state_indices_tensor=None,
                              query_start_loc=None,
-                             seq_lens_tensor=None):
+                             seq_lens_tensor=None,
+                             query_start_loc_p_cpu=None,
+                             state_indices_tensor_cpu=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -135,4 +157,6 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    prep_initial_states=None,
                    state_indices_tensor=state_indices_tensor,
                    query_start_loc=query_start_loc,
-                   query_start_loc_p=query_start_loc)
+                   query_start_loc_p=query_start_loc,
+                   query_start_loc_p_cpu=query_start_loc_p_cpu,
+                   state_indices_tensor_cpu=state_indices_tensor_cpu)

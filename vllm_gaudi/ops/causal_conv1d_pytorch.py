@@ -226,6 +226,12 @@ def hpu_causal_conv1d_fn(
     # Update cache with the latest state_len tokens for this sequence
     with torch.no_grad():
         conv_states[batch_cache_idx, :, -state_len:] = new_state
+    # Commit state write to HPU before any subsequent read (lazy mode)
+    try:
+        import habana_frameworks.torch as _htorch_conv
+        _htorch_conv.core.mark_step()
+    except ImportError:
+        pass
 
     return seq_out.squeeze(0).to(original_dtype)
 
@@ -354,7 +360,21 @@ def hpu_causal_conv1d_fn_update(
     seq_out = _apply_activation(seq_out, activation)
     out = seq_out
 
+    import os as _os_conv
+    _conv_diag = _os_conv.environ.get("CONV_DECODE_DIAG", "0") == "1"
+    if _conv_diag:
+        _norm_before_c = conv_states[batch_cache_idx, :, -state_len:].float().norm().item()
     with torch.no_grad():
         conv_states[batch_cache_idx, :, -state_len:] = new_state
+    # Commit state write to HPU before any subsequent read (lazy mode)
+    try:
+        import habana_frameworks.torch as _htorch_conv
+        _htorch_conv.core.mark_step()
+    except ImportError:
+        pass
+    if _conv_diag:
+        import sys
+        _norm_after_c = conv_states[batch_cache_idx, :, -state_len:].float().norm().item()
+        print(f"[CONV_DECODE] is_prompt={is_prompt} idx={batch_cache_idx.tolist()} norm_before={_norm_before_c:.4f} norm_after={_norm_after_c:.4f} new_state_norm={new_state.float().norm().item():.4f}", flush=True, file=sys.stderr)
 
     return out.to(original_dtype)
